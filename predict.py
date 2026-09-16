@@ -187,7 +187,7 @@ def load_state_dict(path):
         return torch.load(
             path,
             map_location=device,
-            weights_only=True
+            weights_only=False
         )
 
     except TypeError:
