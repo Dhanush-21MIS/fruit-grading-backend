@@ -246,10 +246,19 @@ def load_state_dict(model_path):
 
 
 # ============================================================
-# BUILD ONE MODEL ONLY
+# BUILD ONE MODEL ONLY — MEMORY-OPTIMIZED
 # ============================================================
 
 def build_model(model_name):
+    """
+    Load exactly one model.
+
+    On CPU (Render), the model is first constructed on the PyTorch
+    meta device. The checkpoint is memory-mapped from disk and then
+    attached with assign=True. This avoids the normal peak where both
+    a fully allocated model and a fully materialized checkpoint are
+    resident at the same time.
+    """
 
     if model_name not in MODEL_ARCHITECTURES:
         raise ValueError(f"Unknown model: {model_name}")
@@ -267,27 +276,59 @@ def build_model(model_name):
             f"Expected directory: {MODELS_DIR}"
         )
 
-    # Create ONLY the requested architecture.
-    model = MultiTaskModel(
-        MODEL_ARCHITECTURES[model_name]
-    )
+    # --------------------------------------------------------
+    # Render uses CPU. Meta construction allocates model
+    # structure without allocating parameter storage.
+    # --------------------------------------------------------
+    if device.type == "cpu":
 
-    # Load checkpoint after model creation. This avoids keeping a
-    # second full model architecture in memory.
-    state_dict = load_state_dict(model_path)
+        try:
+            with torch.device("meta"):
+                model = MultiTaskModel(
+                    MODEL_ARCHITECTURES[model_name]
+                )
 
-    try:
+            state_dict = load_state_dict(model_path)
+
+            # assign=True attaches the checkpoint tensors directly
+            # instead of copying every tensor into already allocated
+            # model parameters.
+            model.load_state_dict(
+                state_dict,
+                strict=True,
+                assign=True,
+            )
+
+            del state_dict
+            gc.collect()
+
+        except TypeError as exc:
+            # assign=True is available in modern PyTorch. If an older
+            # version is used, fail with a clear message rather than
+            # silently reverting to a RAM-heavy loading method.
+            raise RuntimeError(
+                "This low-memory deployment requires PyTorch 2.1+ "
+                "because load_state_dict(assign=True) is required."
+            ) from exc
+
+    else:
+        # Local CUDA path.
+        model = MultiTaskModel(
+            MODEL_ARCHITECTURES[model_name]
+        )
+
+        state_dict = load_state_dict(model_path)
+
         model.load_state_dict(
             state_dict,
             strict=True,
         )
-    finally:
-        # The model now owns its parameters. The temporary checkpoint
-        # tensors are no longer needed.
+
         del state_dict
         gc.collect()
 
-    model.to(device)
+        model.to(device)
+
     model.eval()
 
     print(f"{model_name} loaded successfully.")
