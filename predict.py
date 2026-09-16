@@ -251,13 +251,15 @@ def load_state_dict(model_path):
 
 def build_model(model_name):
     """
-    Load exactly one model.
+    Load exactly one model using a memory-efficient CPU path.
 
-    On CPU (Render), the model is first constructed on the PyTorch
-    meta device. The checkpoint is memory-mapped from disk and then
-    attached with assign=True. This avoids the normal peak where both
-    a fully allocated model and a fully materialized checkpoint are
-    resident at the same time.
+    Important:
+    - We do NOT leave the model on the meta device.
+    - The model is created on meta only to avoid initialization cost.
+    - to_empty(device="cpu") allocates real CPU parameter storage.
+    - load_state_dict(assign=False) copies the memory-mapped checkpoint
+      into those CPU tensors.
+    - Only one model is loaded at a time.
     """
 
     if model_name not in MODEL_ARCHITECTURES:
@@ -276,64 +278,77 @@ def build_model(model_name):
             f"Expected directory: {MODELS_DIR}"
         )
 
-    # --------------------------------------------------------
-    # Render uses CPU. Meta construction allocates model
-    # structure without allocating parameter storage.
-    # --------------------------------------------------------
-    if device.type == "cpu":
+    model = None
+    state_dict = None
 
-        try:
+    try:
+        if device.type == "cpu":
+            # Construct the architecture without allocating/initializing
+            # all parameter data.
             with torch.device("meta"):
                 model = MultiTaskModel(
                     MODEL_ARCHITECTURES[model_name]
                 )
 
-            state_dict = load_state_dict(model_path)
+            # Convert meta parameters/buffers into real, uninitialized
+            # CPU storage. This is essential: the model must NOT remain
+            # on the meta device before inference.
+            model = model.to_empty(device="cpu")
 
-            # assign=True attaches the checkpoint tensors directly
-            # instead of copying every tensor into already allocated
-            # model parameters.
-            model.load_state_dict(
-                state_dict,
-                strict=True,
-                assign=True,
+        else:
+            model = MultiTaskModel(
+                MODEL_ARCHITECTURES[model_name]
             )
 
-            del state_dict
-            gc.collect()
-
-        except TypeError as exc:
-            # assign=True is available in modern PyTorch. If an older
-            # version is used, fail with a clear message rather than
-            # silently reverting to a RAM-heavy loading method.
-            raise RuntimeError(
-                "This low-memory deployment requires PyTorch 2.1+ "
-                "because load_state_dict(assign=True) is required."
-            ) from exc
-
-    else:
-        # Local CUDA path.
-        model = MultiTaskModel(
-            MODEL_ARCHITECTURES[model_name]
-        )
-
+        # mmap keeps checkpoint tensor storage backed by the file instead
+        # of eagerly materializing the complete checkpoint in RAM.
         state_dict = load_state_dict(model_path)
 
+        # IMPORTANT:
+        # Do NOT use assign=True here. The previous version attached
+        # checkpoint tensors to a meta model and resulted in:
+        # "Tensor on device meta is not on the expected device cpu!"
+        #
+        # assign=False copies values into the real CPU tensors created
+        # by to_empty().
         model.load_state_dict(
             state_dict,
             strict=True,
+            assign=False,
         )
 
         del state_dict
+        state_dict = None
         gc.collect()
 
         model.to(device)
+        model.eval()
 
-    model.eval()
+        print(f"{model_name} loaded successfully.")
 
-    print(f"{model_name} loaded successfully.")
+        return model
 
-    return model
+    except Exception:
+        if state_dict is not None:
+            del state_dict
+
+        if model is not None:
+            try:
+                model.cpu()
+            except Exception:
+                pass
+
+            del model
+
+        gc.collect()
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        raise
 
 
 # ============================================================
